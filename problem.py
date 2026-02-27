@@ -5,11 +5,11 @@ This file is separate mostly for ease of copying it to freeze the machine and
 reference kernel for testing.
 """
 
+import random
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
-import random
 
 Engine = Literal["alu", "load", "store", "flow"]
 Instruction = dict[Engine, list[tuple]]
@@ -198,21 +198,27 @@ class Machine:
         for core in self.cores:
             if core.state == CoreState.PAUSED:
                 core.state = CoreState.RUNNING
+
         while any(c.state == CoreState.RUNNING for c in self.cores):
             has_non_debug = False
             for core in self.cores:
                 if core.state != CoreState.RUNNING:
                     continue
+
                 if core.pc >= len(self.program):
                     core.state = CoreState.STOPPED
                     continue
+
                 instr = self.program[core.pc]
                 if self.prints:
                     self.print_step(instr, core)
+
                 core.pc += 1
                 self.step(instr, core)
+
                 if any(name != "debug" for name in instr.keys()):
                     has_non_debug = True
+
             if has_non_debug:
                 self.cycle += 1
 
@@ -362,6 +368,7 @@ class Machine:
         }
         self.scratch_write = {}
         self.mem_write = {}
+
         for name, slots in instr.items():
             if name == "debug":
                 if not self.enable_debug:
@@ -380,13 +387,18 @@ class Machine:
                             f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
                         )
                 continue
+
+            print(f"lenSlots = {len(slots)} vs {SLOT_LIMITS[name]}")
             assert len(slots) <= SLOT_LIMITS[name]
+
             for i, slot in enumerate(slots):
                 if self.trace is not None:
                     self.trace_slot(core, slot, name, i)
                 ENGINE_FNS[name](core, *slot)
+
         for addr, val in self.scratch_write.items():
             core.scratch[addr] = val
+
         for addr, val in self.mem_write.items():
             self.mem[addr] = val
 

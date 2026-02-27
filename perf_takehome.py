@@ -16,23 +16,23 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
 import random
 import unittest
+from collections import defaultdict
 
 from problem import (
-    Engine,
-    DebugInfo,
-    SLOT_LIMITS,
-    VLEN,
+    HASH_STAGES,
     N_CORES,
     SCRATCH_SIZE,
+    SLOT_LIMITS,
+    VLEN,
+    DebugInfo,
+    Engine,
+    Input,
     Machine,
     Tree,
-    Input,
-    HASH_STAGES,
-    reference_kernel,
     build_mem_image,
+    reference_kernel,
     reference_kernel2,
 )
 
@@ -49,6 +49,16 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+        # todo: more than one slot per instruction bundle
+        # SLOT_LIMITS = {
+        #     "alu": 12,
+        #     "valu": 6,
+        #     "load": 2,
+        #     "store": 2,
+        #     "flow": 1,
+        #     "debug": 64,
+        # }
+
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
@@ -81,7 +91,9 @@ class KernelBuilder:
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+            slots.append(
+                ("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi)))
+            )
 
         return slots
 
@@ -105,11 +117,13 @@ class KernelBuilder:
             "inp_indices_p",
             "inp_values_p",
         ]
+
         for v in init_vars:
             self.alloc_scratch(v, 1)
+
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.add("load", ("const", tmp1, i))  # -- loads into memory
+            self.add("load", ("load", self.scratch[v], tmp1))  # -- writes to val
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
@@ -134,22 +148,36 @@ class KernelBuilder:
         for round in range(rounds):
             for i in range(batch_size):
                 i_const = self.scratch_const(i)
+
                 # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                )
                 body.append(("load", ("load", tmp_idx, tmp_addr)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
+
                 # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
+                )
                 body.append(("load", ("load", tmp_val, tmp_addr)))
                 body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+
                 # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
+                )
                 body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+                body.append(
+                    ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
+                )
+
+                # -- val = mem[inp_values_p + i]
                 # val = myhash(val ^ node_val)
                 body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
                 body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 body.append(("alu", ("%", tmp1, tmp_val, two_const)))
                 body.append(("alu", ("==", tmp1, tmp1, zero_const)))
@@ -157,15 +185,22 @@ class KernelBuilder:
                 body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
                 body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+
                 # idx = 0 if idx >= n_nodes else idx
                 body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
                 body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+
+                # mem[inp_indices_p + i] = idx # inp_indices_p + i -- this could be stored
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                )
                 body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+
+                # mem[inp_values_p + i] = val # inp_values_p + i -- this could be stored
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
+                )
                 body.append(("store", ("store", tmp_addr, tmp_val)))
 
         body_instrs = self.build(body)
@@ -173,7 +208,9 @@ class KernelBuilder:
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
+
 BASELINE = 147734
+
 
 def do_kernel_test(
     forest_height: int,
