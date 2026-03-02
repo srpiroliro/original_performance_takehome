@@ -18,14 +18,11 @@ We recommend you look through problem.py next.
 
 import random
 import unittest
-from collections import defaultdict
 
 from problem import (
     HASH_STAGES,
     N_CORES,
     SCRATCH_SIZE,
-    SLOT_LIMITS,
-    VLEN,
     DebugInfo,
     Engine,
     Input,
@@ -35,6 +32,7 @@ from problem import (
     reference_kernel,
     reference_kernel2,
 )
+from utils import InstructionRecord, add_to_record, get_addresses
 
 
 class KernelBuilder:
@@ -48,22 +46,52 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # todo: more than one slot per instruction bundle
-        # SLOT_LIMITS = {
-        #     "alu": 12,
-        #     "valu": 6,
-        #     "load": 2,
-        #     "store": 2,
-        #     "flow": 1,
-        #     "debug": 64,
-        # }
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
+        instructions_book: list[InstructionRecord] = []
+        current = InstructionRecord()
 
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+            srcs, dsts = get_addresses(engine, slot)
+
+            # if the current instruciton has any instruciton which writes to X, we cannot have another
+            # instruction which takes that X value, as it updates live.
+            # `and not current.has_any_src(dst)` does not matter as the instruction will not update that value.
+
+            # if engine == "debug":
+            #     # instructions_book.append(current)
+            #     # current = InstructionRecord()
+
+            #     # current.instruction = {"debug": [slot]}  # pyright: ignore[reportAttributeAccessIssue]
+
+            #     # instructions_book.append(current)
+            #     # current = InstructionRecord()
+
+            #     continue
+
+            # # add to previous
+            # if len(instructions_book) > 0:
+            #     prev = instructions_book[-1]
+
+            #     # conflicts
+            #     if not prev.has_any_dst(srcs):
+            #         if add_to_record(prev, engine, slot, srcs, dsts):
+            #             continue
+
+            # add to current
+            if add_to_record(current, engine, slot, srcs, dsts):
+                continue
+
+            # new record
+            instructions_book.append(current)
+            current = InstructionRecord()
+
+            add_to_record(current, engine, slot, srcs, dsts)
+
+        if current.instruction:
+            instructions_book.append(current)
+
+        # return orig
+        return [record.instruction for record in instructions_book]
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -87,6 +115,7 @@ class KernelBuilder:
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
+        # idea: self.scratch_const(X) declare it outside.
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
@@ -121,6 +150,7 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
+        # idea: use vload
         for i, v in enumerate(init_vars):
             self.add("load", ("const", tmp1, i))  # -- loads into memory
             self.add("load", ("load", self.scratch[v], tmp1))  # -- writes to val
@@ -145,22 +175,26 @@ class KernelBuilder:
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
 
+        tmp_i_i = self.alloc_scratch("tmp_p_i")
+        tmp_v_i = self.alloc_scratch("tmp_p_i")
+
         for round in range(rounds):
             for i in range(batch_size):
                 i_const = self.scratch_const(i)
 
-                # idx = mem[inp_indices_p + i]
                 body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                    ("alu", ("+", tmp_i_i, self.scratch["inp_indices_p"], i_const))
                 )
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
+                body.append(
+                    ("alu", ("+", tmp_v_i, self.scratch["inp_values_p"], i_const))
+                )
+
+                # idx = mem[inp_indices_p + i]
+                body.append(("load", ("load", tmp_idx, tmp_i_i)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
 
                 # val = mem[inp_values_p + i]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("load", ("load", tmp_val, tmp_addr)))
+                body.append(("load", ("load", tmp_val, tmp_v_i)))
                 body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
 
                 # node_val = mem[forest_values_p + idx]
@@ -178,6 +212,7 @@ class KernelBuilder:
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
                 body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
 
+                # idea: this could be conditional
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 body.append(("alu", ("%", tmp1, tmp_val, two_const)))
                 body.append(("alu", ("==", tmp1, tmp1, zero_const)))
@@ -191,17 +226,11 @@ class KernelBuilder:
                 body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
 
-                # mem[inp_indices_p + i] = idx # inp_indices_p + i -- this could be stored
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
+                # mem[inp_indices_p + i] = idx
+                body.append(("store", ("store", tmp_i_i, tmp_idx)))
 
-                # mem[inp_values_p + i] = val # inp_values_p + i -- this could be stored
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                # mem[inp_values_p + i] = val
+                body.append(("store", ("store", tmp_v_i, tmp_val)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)

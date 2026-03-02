@@ -388,7 +388,6 @@ class Machine:
                         )
                 continue
 
-            print(f"lenSlots = {len(slots)} vs {SLOT_LIMITS[name]}")
             assert len(slots) <= SLOT_LIMITS[name]
 
             for i, slot in enumerate(slots):
