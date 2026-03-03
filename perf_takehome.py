@@ -144,14 +144,13 @@ class KernelBuilder:
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
-        """
-        tmp1 = self.alloc_scratch("tmp1", VLEN)
-        tmp2 = self.alloc_scratch("tmp2", VLEN)
-        tmp3 = self.alloc_scratch("tmp3", VLEN)
-        # Scratch space addresses
+        NUM_STREAMS = 3
+
+        # per-stream scratch registers
+        tmp1s = [self.alloc_scratch(f"tmp1_{s}", VLEN) for s in range(NUM_STREAMS)]
+        tmp2s = [self.alloc_scratch(f"tmp2_{s}", VLEN) for s in range(NUM_STREAMS)]
+        tmp3s = [self.alloc_scratch(f"tmp3_{s}", VLEN) for s in range(NUM_STREAMS)]
+
         init_vars = [
             "rounds",
             "n_nodes",
@@ -166,8 +165,8 @@ class KernelBuilder:
             self.alloc_scratch(v, 1)
 
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.add("load", ("const", tmp1s[0], i))
+            self.add("load", ("load", self.scratch[v], tmp1s[0]))
 
         n_nodes_v = self.clone_scalar_to_vec(self.scratch["n_nodes"], "n_nodes_v")
         forest_values_p_v = self.clone_scalar_to_vec(
@@ -184,85 +183,95 @@ class KernelBuilder:
         one_const = self.scratch_const_vec(1)
         two_const = self.scratch_const_vec(2)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        body = []
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx", VLEN)
-        tmp_val = self.alloc_scratch("tmp_val", VLEN)
-        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
-        tmp_addr = self.alloc_scratch("tmp_addr", VLEN)
-
-        tmp_indices_p = self.alloc_scratch("tmp_indices_p", VLEN)
-        tmp_values_p = self.alloc_scratch("tmp_values_p", VLEN)
+        tmp_idxs = [self.alloc_scratch(f"tmp_idx_{s}", VLEN) for s in range(NUM_STREAMS)]
+        tmp_vals = [self.alloc_scratch(f"tmp_val_{s}", VLEN) for s in range(NUM_STREAMS)]
+        tmp_node_vals = [self.alloc_scratch(f"tmp_node_val_{s}", VLEN) for s in range(NUM_STREAMS)]
+        tmp_addrs = [self.alloc_scratch(f"tmp_addr_{s}", VLEN) for s in range(NUM_STREAMS)]
+        tmp_indices_ps = [self.alloc_scratch(f"tmp_indices_p_{s}", VLEN) for s in range(NUM_STREAMS)]
+        tmp_values_ps = [self.alloc_scratch(f"tmp_values_p_{s}", VLEN) for s in range(NUM_STREAMS)]
 
         for round in range(rounds):
-            for i in range(0, batch_size, VLEN):
-                i_const = self.scratch_const_vec(i)
+            for i in range(0, batch_size, VLEN * NUM_STREAMS):
+                n_streams = min(NUM_STREAMS, (batch_size - i) // VLEN)
+                streams = range(n_streams)
 
-                # inp_indices_i = inp_indices_addr_consts[i]
-                # inp_values_i = inp_values_addr_consts[i]
+                # compute address pointers for all streams
+                for s in streams:
+                    ic = self.scratch_const_vec(i + s * VLEN)
+                    body.append(("valu", ("+", tmp_indices_ps[s], inp_indices_p_v, ic)))
+                for s in streams:
+                    ic = self.scratch_const_vec(i + s * VLEN)
+                    body.append(("valu", ("+", tmp_values_ps[s], inp_values_p_v, ic)))
 
-                body.append(
-                    (
-                        "valu",
-                        ("+", tmp_indices_p, inp_indices_p_v, i_const),
-                    )
-                )
-                body.append(("valu", ("+", tmp_values_p, inp_values_p_v, i_const)))
+                # load indices
+                for s in streams:
+                    body.append(("load", ("vload", tmp_idxs[s], tmp_indices_ps[s])))
+                    body.append(("debug", ("compare", tmp_idxs[s], (round, i + s * VLEN, "idx"))))
 
-                # idx = mem[inp_indices_p + i]
-                body.append(("load", ("vload", tmp_idx, tmp_indices_p)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-
-                # val = mem[inp_values_p + i]
-                body.append(("load", ("vload", tmp_val, tmp_values_p)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+                # load values
+                for s in streams:
+                    body.append(("load", ("vload", tmp_vals[s], tmp_values_ps[s])))
+                    body.append(("debug", ("compare", tmp_vals[s], (round, i + s * VLEN, "val"))))
 
                 # node_val = mem[forest_values_p + idx]
-                body.append(("valu", ("+", tmp_addr, forest_values_p_v, tmp_idx)))
+                for s in streams:
+                    body.append(("valu", ("+", tmp_addrs[s], forest_values_p_v, tmp_idxs[s])))
                 for lane in range(VLEN):
-                    body.append(("load", ("load_offset", tmp_node_val, tmp_addr, lane)))
-                body.append(
-                    ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
-                )
+                    for s in streams:
+                        body.append(("load", ("load_offset", tmp_node_vals[s], tmp_addrs[s], lane)))
+                for s in streams:
+                    body.append(("debug", ("compare", tmp_node_vals[s], (round, i + s * VLEN, "node_val"))))
 
                 # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(
-                    self.build_hash(tmp_val, tmp1, tmp2, round, i, parallel=True)
-                )
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+                for s in streams:
+                    body.append(("valu", ("^", tmp_vals[s], tmp_vals[s], tmp_node_vals[s])))
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    for s in streams:
+                        body.append(("valu", (op1, tmp1s[s], tmp_vals[s], self.scratch_const_vec(val1))))
+                    for s in streams:
+                        body.append(("valu", (op3, tmp2s[s], tmp_vals[s], self.scratch_const_vec(val3))))
+                    for s in streams:
+                        body.append(("valu", (op2, tmp_vals[s], tmp1s[s], tmp2s[s])))
+                    for s in streams:
+                        body.append(("debug", ("compare", tmp_vals[s], (round, i + s * VLEN, "hash_stage", hi))))
+                for s in streams:
+                    body.append(("debug", ("compare", tmp_vals[s], (round, i + s * VLEN, "hashed_val"))))
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("valu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("valu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("vselect", tmp3, tmp1, one_const, two_const)))
-                body.append(("valu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("valu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+                for s in streams:
+                    body.append(("valu", ("%", tmp1s[s], tmp_vals[s], two_const)))
+                for s in streams:
+                    body.append(("valu", ("==", tmp1s[s], tmp1s[s], zero_const)))
+                for s in streams:
+                    body.append(("flow", ("vselect", tmp3s[s], tmp1s[s], one_const, two_const)))
+                for s in streams:
+                    body.append(("valu", ("*", tmp_idxs[s], tmp_idxs[s], two_const)))
+                for s in streams:
+                    body.append(("valu", ("+", tmp_idxs[s], tmp_idxs[s], tmp3s[s])))
+                for s in streams:
+                    body.append(("debug", ("compare", tmp_idxs[s], (round, i + s * VLEN, "next_idx"))))
 
                 # idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", tmp1, tmp_idx, n_nodes_v)))
-                body.append(("flow", ("vselect", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
+                for s in streams:
+                    body.append(("valu", ("<", tmp1s[s], tmp_idxs[s], n_nodes_v)))
+                for s in streams:
+                    body.append(("flow", ("vselect", tmp_idxs[s], tmp1s[s], tmp_idxs[s], zero_const)))
+                for s in streams:
+                    body.append(("debug", ("compare", tmp_idxs[s], (round, i + s * VLEN, "wrapped_idx"))))
 
-                # mem[inp_indices_p + i] = idx
-                body.append(("store", ("vstore", tmp_indices_p, tmp_idx)))
-
-                # mem[inp_values_p + i] = val
-                body.append(("store", ("vstore", tmp_values_p, tmp_val)))
+                # store results
+                for s in streams:
+                    body.append(("store", ("vstore", tmp_indices_ps[s], tmp_idxs[s])))
+                for s in streams:
+                    body.append(("store", ("vstore", tmp_values_ps[s], tmp_vals[s])))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
 
